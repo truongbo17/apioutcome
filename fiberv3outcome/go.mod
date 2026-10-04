@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/gofiber/fiber/v3 v3.5.0
-	github.com/truongbo17/apioutcome v0.1.0
+	github.com/truongbo17/apioutcome v0.2.0
 )
 
 require (

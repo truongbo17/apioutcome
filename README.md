@@ -116,7 +116,31 @@ The Fiber adapters handle returned errors before Fiber's configured `ErrorHandle
 | [otelchi](https://github.com/riandyrn/otelchi) and OTel HTTP instrumentation | Create spans and collect HTTP telemetry | Yes; apioutcome annotates the active span |
 | Existing `slog` setup | Own log format and destination | Yes; pass your logger |
 
-The narrow purpose is to keep **the public error, completion record, and active trace in agreement** without replacing the rest of the service. See [BENCHMARKS.md](BENCHMARKS.md) for measured cost and reproducible commands.
+The narrow purpose is to keep **the public error, completion record, and active trace in agreement** without replacing the rest of the service.
+
+## Benchmarks
+
+Median of five in-process runs on Apple M5 (macOS 26.2, darwin/amd64), Go 1.25.0, `-cpu=1`. Instrumented cases write JSON `slog` records to `io.Discard`; plain cases do not log. Fiber uses `app.Test`, so compare each middleware result with its own framework's baseline. The plain 422 case writes only a status, while the middleware 422 cases also render a problem body.
+
+| Framework | Case | ns/op | B/op | allocs/op |
+| --- | --- | ---: | ---: | ---: |
+| `net/http` | plain 204 | 125.2 | 208 | 4 |
+| `net/http` | middleware 204 | 1,377 | 1,072 | 17 |
+| `net/http` | `Wrap` 204 | 1,350 | 1,072 | 17 |
+| `net/http` | plain status-only 422 | 115.7 | 208 | 4 |
+| `net/http` | middleware problem 422 | 2,515 | 2,408 | 35 |
+| `net/http` | `Wrap` problem 422 | 2,516 | 2,408 | 35 |
+| Gin | plain 204 | 159.4 | 208 | 4 |
+| Gin | middleware 204 | 1,374 | 760 | 8 |
+| Gin | middleware problem 422 | 2,243 | 1,976 | 21 |
+| Fiber v2 | plain 204 | 3,026 | 5,322 | 18 |
+| Fiber v2 | middleware 204 | 5,478 | 5,514 | 19 |
+| Fiber v2 | middleware problem 422 | 6,960 | 6,372 | 32 |
+| Fiber v3 | plain 204 | 2,653 | 5,353 | 19 |
+| Fiber v3 | middleware 204 | 5,210 | 5,546 | 20 |
+| Fiber v3 | middleware problem 422 | 6,716 | 6,403 | 33 |
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the exact commands, methodology, and limits of these measurements.
 
 ## Development
 

@@ -2,6 +2,7 @@ package apioutcome
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,37 +21,48 @@ type Handler func(http.ResponseWriter, *http.Request) error
 // Options configures the completion logger. A nil Logger uses slog.Default.
 type Options struct{ Logger *slog.Logger }
 
-// Wrap converts returned errors and panics to problem responses where the
-// response is not yet committed. It reports every completed request once.
-func Wrap(handler Handler, opts Options) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		started := time.Now()
-		state := &responseState{status: http.StatusOK}
-		tracked := state.wrap(w)
-		var handlerErr error
-		defer func() {
-			if recover() != nil {
-				handlerErr = errors.New("handler panic")
+// Middleware observes an existing http.Handler without changing its signature.
+// Install it once around the router so unmatched routes are observed too.
+func Middleware(opts Options) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, nested := r.Context().Value(stateKey{}).(*responseState); nested {
+				next.ServeHTTP(w, r)
+				return
 			}
-			code := "ok"
-			if handlerErr != nil {
-				problem := classify(handlerErr)
-				code = problem.Code
-				if !state.committed {
-					Render(w, r, handlerErr)
-					state.status = problem.Status
+			started := time.Now()
+			state := &responseState{status: http.StatusOK}
+			r = r.WithContext(context.WithValue(r.Context(), stateKey{}, state))
+			tracked := state.wrap(w)
+			defer func() {
+				if recover() != nil {
+					WriteError(tracked, r, errors.New("handler panic"))
 				}
-			} else if state.status >= 400 {
-				code = "unclassified_http_error"
-			}
-			Report(r.Context(), opts.Logger, Event{
-				Method: r.Method, Status: state.status, Code: code,
-				ErrorAfterCommit: state.committed && handlerErr != nil,
-				Duration:         time.Since(started),
-			})
-		}()
-		handlerErr = handler(tracked, r)
-	})
+				if state.code == "" {
+					state.code = "ok"
+					if state.status >= 400 {
+						state.code = "unclassified_http_error"
+					}
+				}
+				Report(r.Context(), opts.Logger, Event{
+					Method: r.Method, Status: state.status, Code: state.code,
+					ErrorAfterCommit: state.errorAfterCommit,
+					Duration:         time.Since(started),
+				})
+			}()
+			next.ServeHTTP(tracked, r)
+		})
+	}
+}
+
+// Wrap adapts a returned-error handler. Existing handlers can use Middleware
+// and WriteError instead, without changing their signature.
+func Wrap(handler Handler, opts Options) http.Handler {
+	return Middleware(opts)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := handler(w, r); err != nil {
+			WriteError(w, r, err)
+		}
+	}))
 }
 
 // NotFound returns an HTTP fallback handler for unmatched routes. Register it
@@ -59,6 +71,22 @@ func NotFound(opts Options) http.Handler {
 	return Wrap(func(http.ResponseWriter, *http.Request) error {
 		return Problem(http.StatusNotFound, "not_found", "", nil)
 	}, opts)
+}
+
+// WriteError records a public code and writes a problem response. When called
+// under Middleware after the response is committed, it only records the code.
+func WriteError(w http.ResponseWriter, r *http.Request, err error) {
+	problem := classify(err)
+	if r != nil {
+		if state, ok := r.Context().Value(stateKey{}).(*responseState); ok {
+			state.code = problem.Code
+			if state.committed {
+				state.errorAfterCommit = true
+				return
+			}
+		}
+	}
+	Render(w, r, err)
 }
 
 // Render writes an RFC 9457-shaped problem response and returns its public
@@ -82,9 +110,13 @@ func Render(w http.ResponseWriter, r *http.Request, err error) *Error {
 }
 
 type responseState struct {
-	status    int
-	committed bool
+	status           int
+	committed        bool
+	code             string
+	errorAfterCommit bool
 }
+
+type stateKey struct{}
 
 func (s *responseState) commit(status int) {
 	if !s.committed {
@@ -106,17 +138,11 @@ func (s *responseState) wrap(w http.ResponseWriter) http.ResponseWriter {
 		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
 			return func(b []byte) (int, error) { s.commit(http.StatusOK); return next(b) }
 		},
-		WriteString: func(next httpsnoop.WriteStringFunc) httpsnoop.WriteStringFunc {
-			return func(value string) (int, error) { s.commit(http.StatusOK); return next(value) }
-		},
 		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
 			return func(src io.Reader) (int64, error) { s.commit(http.StatusOK); return next(src) }
 		},
 		Flush: func(next httpsnoop.FlushFunc) httpsnoop.FlushFunc {
 			return func() { s.commit(http.StatusOK); next() }
-		},
-		FlushError: func(next httpsnoop.FlushErrorFunc) httpsnoop.FlushErrorFunc {
-			return func() error { s.commit(http.StatusOK); return next() }
 		},
 		Hijack: func(next httpsnoop.HijackFunc) httpsnoop.HijackFunc {
 			return func() (net.Conn, *bufio.ReadWriter, error) {

@@ -1,89 +1,122 @@
 # apioutcome
 
-**Keep an HTTP failure visible in the response, completion log, and active OpenTelemetry span.**
+**One request outcome across HTTP response, completion log, and the active trace.**
 
-`apioutcome` is a small Go library for existing backend APIs. Handlers explicitly return errors. The adapter turns an error returned before response commit into an `application/problem+json` response, writes one structured `slog` completion record, and annotates the active OTel span. It does not replace Gin, a validator, a logger, or an OTel exporter.
-
-This is an early `v0` project. The API may change before `v1`.
-
-## Why
-
-Some request failures occur during body decoding or validation, before normal handler logic. If every endpoint maps those errors separately, the HTTP response and telemetry can disagree. `apioutcome` provides one explicit path for those failures. It only observes handlers and routes wired through its adapters; it cannot intercept arbitrary errors from existing framework internals.
-
-## Install
-
-```sh
-go get github.com/truongbo17/apioutcome@latest
-```
-
-The module currently requires Go 1.25 or later. The root package uses `slog`, OpenTelemetry API, and `httpsnoop`. The `ginoutcome` adapter supports Gin 1.12.
-
-## `net/http` example
+`apioutcome` is for Go backend APIs that already have a router, logger, and optional OpenTelemetry instrumentation. Add one middleware to observe existing routes. Where an endpoint needs a stable public error code, return or write a `Problem`. The library emits one safe `slog` record per request and annotates the span already in the request context. It does not start a tracer or require a new handler signature.
 
 ```go
-logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-opts := apioutcome.Options{Logger: logger}
-
-mux := http.NewServeMux()
-mux.Handle("POST /orders", apioutcome.Wrap(func(w http.ResponseWriter, r *http.Request) error {
-    var input struct { ProductID string `json:"product_id"` }
-    if err := apioutcome.DecodeJSON(r, &input, 64*1024); err != nil {
-        return err
-    }
-    if input.ProductID == "" {
-        return apioutcome.Problem(422, "invalid_order", "product_id is required", nil)
-    }
-    w.WriteHeader(http.StatusCreated)
-    return nil
-}, opts))
-mux.Handle("/", apioutcome.NotFound(opts))
+// Existing net/http router and handlers still work.
+handler := apioutcome.Middleware(apioutcome.Options{Logger: logger})(mux)
+http.ListenAndServe(":8080", handler)
 ```
 
-Run the complete example with `go run ./examples/orders`, then send:
+This is a v0 library: review the [contract](SPEC.md) before production use.
+
+## Install and compatibility
+
+| Integration | Package | Tested framework | Go minimum |
+| --- | --- | --- | --- |
+| `net/http` and compatible routers | `github.com/truongbo17/apioutcome` | Go standard library | 1.22 |
+| Gin | `github.com/truongbo17/apioutcome/ginoutcome` | Gin 1.10.1 | 1.22 |
+| Fiber v2 | `github.com/truongbo17/apioutcome/fiberoutcome` | Fiber 2.52.15 | 1.22 |
+| Fiber v3 | `github.com/truongbo17/apioutcome/fiberv3outcome` | Fiber 3.5.0 | 1.25, separate module |
 
 ```sh
-curl -i -X POST localhost:8080/orders -d '{"product_id":'
+go get github.com/truongbo17/apioutcome@v0.2.0
+# Only Fiber v3 users need this separate module:
+go get github.com/truongbo17/apioutcome/fiberv3outcome@v0.1.0
 ```
 
-The response is HTTP 400 with `code: "invalid_json"`; the completion log carries the same code. If OTel instrumentation has already placed a span in the request context, the span receives `apioutcome.code` and `http.response.status_code`. `apioutcome` does not create a duplicate span or configure an exporter.
+The root module is tested on Go 1.22, 1.24, and 1.26. The Fiber v3 module is tested on Go 1.25 and 1.26. Its separate `go.mod` keeps newer Fiber dependencies out of the root module. Framework versions above are the versions pinned for testing, not a promise that every earlier or later framework release is compatible.
 
-## Gin example
+## Adopt in an existing service
+
+### `net/http`, chi, and other `http.Handler` routers
+
+```go
+opts := apioutcome.Options{Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil))}
+mux := http.NewServeMux()
+mux.HandleFunc("POST /orders", func(w http.ResponseWriter, r *http.Request) {
+    var order struct { ProductID string `json:"product_id"` }
+    if err := apioutcome.DecodeJSON(r, &order, 64*1024); err != nil {
+        apioutcome.WriteError(w, r, err)
+        return
+    }
+    if order.ProductID == "" {
+        apioutcome.WriteError(w, r, apioutcome.Problem(422, "invalid_order", "product_id is required", nil))
+        return
+    }
+    w.WriteHeader(http.StatusCreated)
+})
+http.ListenAndServe(":8080", apioutcome.Middleware(opts)(mux))
+```
+
+The middleware observes **all** routes, including the router's 404 and handlers you have not changed. `WriteError` is only needed where you want a consistent problem response and code. For a handler that naturally returns an error, `apioutcome.Wrap(handler, opts)` remains available. `WriteError` must run before response bytes or headers are sent to replace the response; install `Middleware` around existing handlers so commit state is tracked.
+
+### Gin
 
 ```go
 router := gin.New()
-opts := apioutcome.Options{Logger: logger}
-router.POST("/orders", ginoutcome.Wrap(func(c *gin.Context) error {
-    var input struct { ProductID string `json:"product_id"` }
-    if err := apioutcome.DecodeJSON(c.Request, &input, 64*1024); err != nil {
-        return err
-    }
-    if input.ProductID == "" {
-        return apioutcome.Problem(422, "invalid_order", "product_id is required", nil)
+router.Use(ginoutcome.Middleware(apioutcome.Options{Logger: logger}))
+router.POST("/orders", func(c *gin.Context) {
+    if c.Query("product_id") == "" {
+        ginoutcome.WriteError(c, apioutcome.Problem(422, "invalid_order", "product_id is required", nil))
+        return
     }
     c.Status(http.StatusCreated)
-    return nil
-}, opts))
-router.NoRoute(ginoutcome.NotFound(opts))
+})
 ```
 
-Both examples require the usual imports for Go, Gin, and `github.com/truongbo17/apioutcome/ginoutcome`.
+Existing `gin.HandlerFunc` routes keep their signatures. `ginoutcome.Wrap` is available for returned-error handlers. Put the middleware before routes. Gin's own logger or recovery middleware may produce additional logs or handle panics first depending on order; choose one completion logger and place recovery deliberately.
 
-## Error contract
+### Fiber v2
 
-An unknown error becomes HTTP 500 with `code: "internal_error"`. A public error created by `Problem(status, code, detail, cause)` uses the given status and code. Codes contain only lowercase ASCII letters, digits, and underscores. Invalid status/code values become `internal_error`.
+```go
+app := fiber.New()
+app.Use(fiberoutcome.Middleware(apioutcome.Options{Logger: logger}))
+app.Post("/orders", func(c *fiber.Ctx) error {
+    if c.Query("product_id") == "" {
+        return apioutcome.Problem(422, "invalid_order", "product_id is required", nil)
+    }
+    return c.SendStatus(http.StatusCreated)
+})
+```
 
-The response uses the RFC 9457 `application/problem+json` fields `type`, `title`, and `status`, plus a `code` extension. `type` is `about:blank`, so `title` is the HTTP status phrase. An optional safe `detail` is included for 4xx errors; 5xx details are discarded. The `code` extension is useful inside an application, but RFC 9457 clients should treat `type` as the primary problem identifier. Do not derive public codes or details from user input or private error messages.
+### Fiber v3
 
-`DecodeJSON` reads at most `maxBytes + 1` bytes, rejects unknown fields and trailing JSON values, and maps malformed input to `invalid_json` and oversized input to `body_too_large`. A nonpositive limit uses 1 MiB. Semantic validation remains your application's responsibility; return a 4xx `Problem` from the handler.
+```go
+app := fiber.New()
+app.Use(fiberv3outcome.Middleware(apioutcome.Options{Logger: logger}))
+app.Post("/orders", func(c fiber.Ctx) error {
+    if c.Query("product_id") == "" {
+        return apioutcome.Problem(422, "invalid_order", "product_id is required", nil)
+    }
+    return c.SendStatus(http.StatusCreated)
+})
+```
 
-## Operational behavior and limits
+The Fiber adapters handle returned errors before Fiber's configured `ErrorHandler` runs. If you have a custom `ErrorHandler`, decide which behavior should own error responses and test middleware order. The adapters preserve a body or nondefault status already set before a later error. They do not include or log private error text.
 
-- `Wrap` and `ginoutcome.Wrap` convert returned errors and panics only before the response is committed. If the handler already sent bytes or headers, the response stays intact; the completion record marks `error_after_commit: true`.
-- A handler that writes a 4xx or 5xx response and returns `nil` is recorded as `unclassified_http_error`. Return a `Problem` before writing for a stable code.
-- Logs include method, status, code, duration, commit state, and an existing trace ID. They never include URL paths, query strings, request bodies, private causes, or panic values. OTel spans receive safe status and code attributes; 5xx outcomes are marked as errors.
-- To cover unmatched routes, register `NotFound`/`ginoutcome.NotFound` as shown. Middleware and routes outside these adapters are outside the observation boundary.
-- Streaming, WebSocket, and hijacked handlers can pass through the `net/http` wrapper, but an error after their first write cannot be turned into a JSON problem response. The `httpsnoop` dependency preserves standard optional `ResponseWriter` interfaces.
-- Existing OTel HTTP instrumentation may already set some span attributes. This library annotates that span; configure instrumentation order and sampling in your application.
+## What the library guarantees
+
+- A `Problem(status, code, detail, cause)` before response commit writes `application/problem+json` with `type: "about:blank"`, the HTTP status phrase as `title`, and a `code` extension. The code is an application constant: lowercase letters, digits, and underscores. Safe `detail` is included only for 4xx; 5xx detail and `cause` stay private.
+- Unknown returned errors become HTTP 500 `internal_error`. A handler that directly writes a 4xx or 5xx without calling `WriteError` is logged as `unclassified_http_error`; the library does not reinterpret its body.
+- Completion logs include method, status, code, duration, `error_after_commit`, and a trace ID if available. They exclude paths, query strings, request bodies, error causes, and panic values. The active OTel span receives the status and code; the library creates no span or exporter.
+- `DecodeJSON` bounds the request body and rejects unknown fields and trailing values. It handles JSON syntax and size, not application validation rules.
+- A response already committed stays intact. The completion event flags a later error. Streaming and WebSocket responses can be observed, but cannot be replaced with JSON after their first write.
+
+`about:blank` follows [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html); clients should use `type` as the primary problem identifier under that standard. The `code` extension is useful for application-specific handling. Keep public codes and details in trusted source code.
+
+## Where it fits
+
+| Project | Primary job | Use with apioutcome |
+| --- | --- | --- |
+| [Gin](https://github.com/gin-gonic/gin), [Fiber](https://github.com/gofiber/fiber) | HTTP routing and framework middleware | Yes; use the matching adapter |
+| [Huma](https://github.com/danielgtaylor/huma) | API schema, validation, OpenAPI, and HTTP framework | Usually choose Huma's own error flow; apioutcome targets existing routers |
+| [otelchi](https://github.com/riandyrn/otelchi) and OTel HTTP instrumentation | Create spans and collect HTTP telemetry | Yes; apioutcome annotates the active span |
+| Existing `slog` setup | Own log format and destination | Yes; pass your logger |
+
+The narrow purpose is to keep **the public error, completion record, and active trace in agreement** without replacing the rest of the service. See [BENCHMARKS.md](BENCHMARKS.md) for measured cost and reproducible commands.
 
 ## Development
 
@@ -91,11 +124,7 @@ The response uses the RFC 9457 `application/problem+json` fields `type`, `title`
 go test ./...
 go test -race ./...
 go vet ./...
-go test -bench=. -run=^$ ./...
+(cd fiberv3outcome && go test ./... && go vet ./...)
 ```
 
-See [SPEC.md](SPEC.md) for the MVP contract and [SECURITY.md](SECURITY.md) for vulnerability reporting.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+See [SPEC.md](SPEC.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).

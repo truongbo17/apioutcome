@@ -2,6 +2,7 @@ package apioutcome_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -152,8 +153,8 @@ func TestHEADProblemHasNoBody(t *testing.T) {
 func TestExistingSpanReceivesSafeOutcome(t *testing.T) {
 	recorder := tracetest.NewSpanRecorder()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
-	defer func() { _ = provider.Shutdown(t.Context()) }()
-	ctx, span := provider.Tracer("apioutcome-test").Start(t.Context(), "request")
+	defer func() { _ = provider.Shutdown(context.Background()) }()
+	ctx, span := provider.Tracer("apioutcome-test").Start(context.Background(), "request")
 
 	var log bytes.Buffer
 	handler := outcome.Wrap(func(http.ResponseWriter, *http.Request) error {
@@ -217,5 +218,44 @@ func TestNotFoundUsesSharedProblemPath(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), `"code":"not_found"`) {
 		t.Fatalf("log = %q", log.String())
+	}
+}
+
+func TestMiddlewareObservesExistingHandlerWithoutSignatureChange(t *testing.T) {
+	var log bytes.Buffer
+	wrapped := outcome.Middleware(outcome.Options{Logger: slog.New(slog.NewJSONHandler(&log, nil))})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	response := httptest.NewRecorder()
+	wrapped.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/private?token=secret", nil))
+	if response.Code != 403 || !strings.Contains(log.String(), `"code":"unclassified_http_error"`) {
+		t.Fatalf("response/log = %d %q", response.Code, log.String())
+	}
+	if strings.Contains(log.String(), "secret") {
+		t.Fatalf("query leaked: %q", log.String())
+	}
+}
+
+func TestWriteErrorAlignsExistingHandler(t *testing.T) {
+	var log bytes.Buffer
+	wrapped := outcome.Middleware(outcome.Options{Logger: slog.New(slog.NewJSONHandler(&log, nil))})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outcome.WriteError(w, r, outcome.Problem(422, "invalid_order", "Missing product", nil))
+	}))
+	response := httptest.NewRecorder()
+	wrapped.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/orders", nil))
+	if response.Code != 422 || !strings.Contains(response.Body.String(), `"code":"invalid_order"`) || !strings.Contains(log.String(), `"code":"invalid_order"`) {
+		t.Fatalf("response/log = %d %q %q", response.Code, response.Body.String(), log.String())
+	}
+}
+
+func TestNestedWrapAndMiddlewareLogOnce(t *testing.T) {
+	var log bytes.Buffer
+	opts := outcome.Options{Logger: slog.New(slog.NewJSONHandler(&log, nil))}
+	inner := outcome.Wrap(func(http.ResponseWriter, *http.Request) error {
+		return outcome.Problem(400, "invalid_json", "", nil)
+	}, opts)
+	outcome.Middleware(opts)(inner).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	if strings.Count(log.String(), "\n") != 1 {
+		t.Fatalf("expected one completion record, got %q", log.String())
 	}
 }
